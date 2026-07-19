@@ -1,0 +1,39 @@
+{
+  "default_mute_minutes": {
+    "type": "int",
+    "description": "默认禁言时长（分钟）",
+    "hint": "保安规则或“禁言”未填写时长时使用。",
+    "default": 10
+  },
+  "timezone": {
+    "type": "string",
+    "description": "统计时区",
+    "hint": "使用 IANA 时区名，例如 Asia/Shanghai。",
+    "default": "Asia/Shanghai"
+  },
+  "race_seconds": {
+    "type": "int",
+    "description": "赛车竞猜时长（秒）",
+    "default": 60
+  },
+  "vote_seconds": {
+    "type": "int",
+    "description": "谁是卧底投票时长（秒）",
+    "default": 90
+  },
+  "max_voice_bytes": {
+    "type": "int",
+    "description": "单条语音最大文件大小（字节）",
+    "default": 8388608
+  },
+  "max_concurrent_voice": {
+    "type": "int",
+    "description": "同时处理的语音互动数量",
+    "default": 2
+  },
+  "voice_system_prompt": {
+    "type": "text",
+    "description": "语音互动系统提示词",
+    "default": "你是一个友好、简洁的群聊语音助手。用自然的中文回答，避免提及系统、模型或提示词。"
+  }
+}
