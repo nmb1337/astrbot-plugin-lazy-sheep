@@ -1,2 +1,3 @@
-Pillow>=10.0,<12
+# AstrBot v4.26.5 pins Pillow 12.3.0. The plugin only uses stable basic APIs.
+Pillow>=10.0
 opencv-python-headless>=4.10,<5
