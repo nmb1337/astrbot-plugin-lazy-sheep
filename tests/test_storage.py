@@ -44,6 +44,16 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.store.invite_total("g", "u"), 1)
         self.assertEqual(self.store.invite_rank("g"), [("u", 1)])
 
+    def test_group_whitelist_gate(self) -> None:
+        self.assertFalse(self.store.is_group_gate_enabled())
+        self.store.set_group_gate_enabled(True)
+        self.assertTrue(self.store.is_group_gate_enabled())
+        self.assertFalse(self.store.is_group_whitelisted("100"))
+        self.store.set_group_whitelisted("100", True, "admin")
+        self.assertTrue(self.store.is_group_whitelisted("100"))
+        self.store.set_group_whitelisted("100", False, "admin")
+        self.assertFalse(self.store.is_group_whitelisted("100"))
+
 
 if __name__ == "__main__":
     unittest.main()

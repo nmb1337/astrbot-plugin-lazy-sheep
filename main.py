@@ -8,6 +8,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from astrbot.api import logger
@@ -22,6 +23,7 @@ from .rules import (
     find_keyword_action,
     find_number_or_link,
     find_segment_kinds,
+    extract_plain_text,
     parse_target_from_text,
     stronger_action,
 )
@@ -58,6 +60,7 @@ class LazySheepPlugin(Star):
         self.games = GameManager()
         self.race_tasks: dict[str, asyncio.Task] = {}
         self.vote_tasks: dict[str, asyncio.Task] = {}
+        self._member_role_cache: dict[tuple[str, str], tuple[float, str]] = {}
         self.voice_semaphore = asyncio.Semaphore(max(1, self._config_int("max_concurrent_voice", 2)))
 
     def _database_path(self) -> Path:
@@ -110,9 +113,16 @@ class LazySheepPlugin(Star):
         if not caller:
             raise RuntimeError("OneBot 客户端不支持 call_action")
         try:
-            return await caller(action=action, **payload)
+            result = await caller(action=action, **payload)
         except TypeError:
-            return await caller(action, **payload)
+            result = await caller(action, **payload)
+        if isinstance(result, Mapping):
+            retcode = result.get("retcode", 0)
+            status = str(result.get("status", "ok")).lower()
+            if str(retcode) not in {"0", "none"} or status in {"failed", "error"}:
+                detail = result.get("wording") or result.get("message") or result.get("msg") or "OneBot 操作失败"
+                raise RuntimeError(f"{detail}（retcode={retcode}）")
+        return result
 
     async def _send_group(self, event: AstrMessageEvent, text: str) -> None:
         await self._onebot_action(
@@ -125,25 +135,63 @@ class LazySheepPlugin(Star):
     async def _send_private(self, event: AstrMessageEvent, user_id: str, text: str) -> None:
         await self._onebot_action(event, "send_private_msg", user_id=self._number(user_id), message=text)
 
-    async def _is_manager(self, event: AstrMessageEvent) -> bool:
-        """AstrBot 管理员或当前 QQ 群主/管理员才可进行管理操作。"""
-        if event.is_admin():
-            return True
+    async def _get_member_role(self, event: AstrMessageEvent, user_id: str, force: bool = False) -> str:
+        """读取并短时缓存 QQ 群角色，避免每条消息都调用 OneBot。"""
         group_id = self._group_id(event)
-        if not group_id:
-            return False
+        cache_key = (group_id, user_id)
+        if not force and cache_key in self._member_role_cache:
+            expires_at, role = self._member_role_cache[cache_key]
+            if monotonic() < expires_at:
+                return role
+        if not force and user_id == event.get_sender_id():
+            sender = self._raw(event).get("sender", {})
+            if isinstance(sender, Mapping) and str(sender.get("role", "member")) in {"owner", "admin", "member"}:
+                role = str(sender.get("role", "member"))
+                self._member_role_cache[cache_key] = (monotonic() + 60, role)
+                return role
         try:
             info = await self._onebot_action(
                 event,
                 "get_group_member_info",
                 group_id=self._number(group_id),
-                user_id=self._number(event.get_sender_id()),
+                user_id=self._number(user_id),
                 no_cache=False,
             )
         except Exception as exc:
             logger.warning("无法读取群成员权限: %s", exc)
-            return False
-        return str((info or {}).get("role", "member")) in {"owner", "admin"}
+            return "member"
+        if isinstance(info, Mapping) and isinstance(info.get("data"), Mapping):
+            info = info["data"]
+        role = str(info.get("role", "member")) if isinstance(info, Mapping) else "member"
+        self._member_role_cache[cache_key] = (monotonic() + 60, role)
+        return role
+
+    async def _is_manager(self, event: AstrMessageEvent) -> bool:
+        """AstrBot 管理员或当前 QQ 群主/管理员才可进行管理操作。"""
+        if event.is_admin():
+            return True
+        return (await self._get_member_role(event, event.get_sender_id())) in {"owner", "admin"}
+
+    async def _is_group_owner(self, event: AstrMessageEvent, user_id: str) -> bool:
+        return await self._get_member_role(event, user_id, force=True) == "owner"
+
+    async def _require_group_owner(self, event: AstrMessageEvent) -> str | None:
+        if not self._is_group(event):
+            return "此功能仅可在 QQ 群聊中使用。"
+        if event.get_platform_name() != "aiocqhttp":
+            return "此功能仅支持 QQ OneBot v11。"
+        if not await self._is_group_owner(event, event.get_sender_id()):
+            return "只有当前 QQ 群主可以上下管理。"
+        if not await self._is_group_owner(event, event.get_self_id()):
+            return "机器人不是本群群主，QQ 协议不允许上下管理。"
+        return None
+
+    async def _is_whitelisted_member(self, event: AstrMessageEvent) -> bool:
+        group_id = self._group_id(event)
+        user_id = event.get_sender_id()
+        if self.store.is_list_member(group_id, user_id, "white"):
+            return True
+        return (await self._get_member_role(event, user_id)) in {"owner", "admin"}
 
     async def _require_manager(self, event: AstrMessageEvent) -> str | None:
         if not self._is_group(event):
@@ -219,6 +267,7 @@ class LazySheepPlugin(Star):
         """仅在二维码规则开启时调用，避免普通图片消息带来额外耗时。"""
         try:
             import cv2  # 延迟导入，插件无法安装依赖时仍可加载其他功能。
+            import numpy as np
         except ImportError:
             logger.warning("未安装 OpenCV，二维码保安无法工作")
             return False
@@ -228,8 +277,17 @@ class LazySheepPlugin(Star):
                 continue
             try:
                 local_path = await component.convert_to_file_path()
-                decoded, _, _ = detector.detectAndDecode(local_path)
+                image_bytes = np.fromfile(str(local_path), dtype=np.uint8)
+                image = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
+                if image is None:
+                    image = cv2.imread(str(local_path))
+                if image is None:
+                    continue
+                decoded, _, _ = detector.detectAndDecode(image)
                 if decoded:
+                    return True
+                multi_result = detector.detectAndDecodeMulti(image)
+                if len(multi_result) >= 1 and bool(multi_result[0]):
                     return True
             except Exception as exc:
                 logger.debug("二维码检测失败: %s", exc)
@@ -239,17 +297,22 @@ class LazySheepPlugin(Star):
         """执行关键词/保安规则；返回 True 表示消息已经被拦截。"""
         group_id = self._group_id(event)
         user_id = event.get_sender_id()
-        if self.store.is_list_member(group_id, user_id, "white"):
+        if await self._is_whitelisted_member(event):
             return False
 
-        text = event.message_str or ""
+        raw_segments = self._raw(event).get("message", [])
+        text = extract_plain_text(
+            event.get_messages(),
+            raw_segments if isinstance(raw_segments, list) else [],
+        )
         keyword = find_keyword_action(text, self.store.get_keyword_rules(group_id))
         if keyword and keyword[1] == "kick":
             action = "kick"
             reason = f"踢人词：{keyword[0]}"
         else:
-            raw_segments = self._raw(event).get("message", [])
-            kinds = find_number_or_link(text) | find_segment_kinds(raw_segments if isinstance(raw_segments, list) else [])
+            kinds = find_number_or_link(text) | find_segment_kinds(event.get_messages())
+            if isinstance(raw_segments, list):
+                kinds |= find_segment_kinds(raw_segments)
             enabled = self.store.get_security_rules(group_id)
             if "qrcode" in enabled and "image" in kinds and await self._has_qrcode(event):
                 kinds.add("qrcode")
@@ -261,11 +324,14 @@ class LazySheepPlugin(Star):
         if not action:
             return False
 
-        message_id = str(getattr(event.message_obj, "message_id", ""))
-        try:
-            if message_id:
+        message_id = str(getattr(event.message_obj, "message_id", "") or self._raw(event).get("message_id", ""))
+        if message_id:
+            try:
                 await self._onebot_action(event, "delete_msg", message_id=self._number(message_id))
-            if action == "mute":
+            except Exception as exc:
+                logger.warning("撤回违规消息失败，继续执行后续动作: %s", exc)
+        if action == "mute":
+            try:
                 await self._onebot_action(
                     event,
                     "set_group_ban",
@@ -273,7 +339,10 @@ class LazySheepPlugin(Star):
                     user_id=self._number(user_id),
                     duration=self._config_int("default_mute_minutes", 10) * 60,
                 )
-            elif action == "kick":
+            except Exception as exc:
+                logger.warning("禁言违规成员失败: %s", exc)
+        elif action == "kick":
+            try:
                 await self._onebot_action(
                     event,
                     "set_group_kick",
@@ -281,9 +350,9 @@ class LazySheepPlugin(Star):
                     user_id=self._number(user_id),
                     reject_add_request=False,
                 )
-            logger.info("群 %s 拦截成员 %s 的消息，原因：%s", group_id, user_id, reason)
-        except Exception as exc:
-            logger.warning("执行保安动作失败: %s", exc)
+            except Exception as exc:
+                logger.warning("踢出违规成员失败: %s", exc)
+        logger.info("群 %s 拦截成员 %s 的消息，原因：%s", group_id, user_id, reason)
         event.stop_event()
         return True
 
@@ -334,6 +403,31 @@ class LazySheepPlugin(Star):
         self.games.activate_undercover(group_id)
         return CommandReply(text="词语已私聊发出！请所有存活玩家依次描述词语；发起人发送“开始投票”进入投票。")
 
+    async def _dispatch_group_whitelist_command(self, event: AstrMessageEvent, text: str) -> CommandReply | None:
+        """处理不受群门禁影响的全局白名单命令。"""
+        if text in {"开启群白名单", "关闭群白名单"}:
+            if not event.is_admin():
+                return CommandReply(text="只有 AstrBot 管理员可以切换群白名单总开关。")
+            enabled = text == "开启群白名单"
+            self.store.set_group_gate_enabled(enabled)
+            return CommandReply(text=f"群白名单总开关已{'开启' if enabled else '关闭'}。")
+        group_match = re.fullmatch(r"(加|删)群白名单\s+(\d{4,15})", text)
+        if group_match:
+            if not event.is_admin():
+                return CommandReply(text="只有 AstrBot 管理员可以指定群白名单群号。")
+            present = group_match.group(1) == "加"
+            group_id = group_match.group(2)
+            self.store.set_group_whitelisted(group_id, present, event.get_sender_id())
+            return CommandReply(text=f"已{'加入' if present else '移出'}群白名单：{group_id}")
+        if text == "群白名单":
+            if not event.is_admin():
+                return CommandReply(text="只有 AstrBot 管理员可以查看群白名单。")
+            rows = self.store.list_group_whitelist()
+            groups = "、".join(row[0] for row in rows) or "暂无"
+            state = "开启" if self.store.is_group_gate_enabled() else "关闭"
+            return CommandReply(text=f"群白名单总开关：{state}\n已登记群：{groups}")
+        return None
+
     async def _handle_voice(self, event: AstrMessageEvent) -> CommandReply:
         group_id = self._group_id(event)
         if self.store.get_group_setting(group_id, "voice_mode", "0") != "1":
@@ -374,10 +468,21 @@ class LazySheepPlugin(Star):
         """返回 None 表示普通聊天，不应截断 AstrBot 的默认消息流程。"""
         if text in MENU_IMAGES:
             return CommandReply(image_path=str(self.assets / MENU_IMAGES[text]))
+        global_whitelist_reply = await self._dispatch_group_whitelist_command(event, text)
+        if global_whitelist_reply is not None:
+            return global_whitelist_reply
         if not self._is_group(event):
             return None
         group_id = self._group_id(event)
         user_id = event.get_sender_id()
+
+        if text in {"群开机", "群关机"}:
+            denied = await self._require_manager(event)
+            if denied:
+                return CommandReply(text=denied)
+            present = text == "群开机"
+            self.store.set_group_whitelisted(group_id, present, user_id)
+            return CommandReply(text=f"当前群已{'开机并加入' if present else '关机并移出'}群白名单。")
 
         # 统计与签到（所有群成员可使用）。
         if text == "我的发言":
@@ -539,6 +644,9 @@ class LazySheepPlugin(Star):
                 return CommandReply(text=f"请使用“{command} @成员”或“{command} QQ号”。")
             try:
                 if command in {"上管", "下管"}:
+                    owner_denied = await self._require_group_owner(event)
+                    if owner_denied:
+                        return CommandReply(text=owner_denied)
                     await self._onebot_action(
                         event,
                         "set_group_admin",
@@ -596,6 +704,18 @@ class LazySheepPlugin(Star):
             event.stop_event()
             return
         text = (event.message_str or "").strip()
+        if self._is_group(event) and self.store.is_group_gate_enabled() and not self.store.is_group_whitelisted(self._group_id(event)):
+            gate_bootstrap_commands = {
+                "群开机",
+                "开启群白名单",
+                "关闭群白名单",
+                "群白名单",
+            }
+            is_targeted_whitelist_command = bool(re.fullmatch(r"(加|删)群白名单\s+\d{4,15}", text))
+            if text not in gate_bootstrap_commands and not is_targeted_whitelist_command:
+                event.should_call_llm(False)
+                event.stop_event()
+                return
         reply = await self._dispatch_command(event, text)
         if reply is not None:
             event.stop_event()

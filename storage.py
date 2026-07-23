@@ -40,6 +40,11 @@ class LazySheepStore:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS group_whitelist (
+                group_id TEXT PRIMARY KEY, added_by TEXT NOT NULL, added_at TEXT NOT NULL
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS security_rules (
                 group_id TEXT NOT NULL, kind TEXT NOT NULL, action TEXT NOT NULL,
                 PRIMARY KEY (group_id, kind)
@@ -98,6 +103,39 @@ class LazySheepStore:
                 "SELECT value FROM group_settings WHERE group_id=? AND key=?", (group_id, key)
             ).fetchone()
         return str(row["value"]) if row else default
+
+    def set_group_gate_enabled(self, enabled: bool) -> None:
+        self.set_group_setting("__global__", "group_whitelist_gate", "1" if enabled else "0")
+
+    def is_group_gate_enabled(self) -> bool:
+        return self.get_group_setting("__global__", "group_whitelist_gate", "0") == "1"
+
+    def set_group_whitelisted(self, group_id: str, present: bool, actor_id: str = "system") -> None:
+        now = datetime.now(self.timezone).isoformat(timespec="seconds")
+        with self.lock:
+            if present:
+                self.connection.execute(
+                    "INSERT INTO group_whitelist(group_id,added_by,added_at) VALUES(?,?,?) "
+                    "ON CONFLICT(group_id) DO UPDATE SET added_by=excluded.added_by,added_at=excluded.added_at",
+                    (group_id, actor_id, now),
+                )
+            else:
+                self.connection.execute("DELETE FROM group_whitelist WHERE group_id=?", (group_id,))
+            self.connection.commit()
+
+    def is_group_whitelisted(self, group_id: str) -> bool:
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT 1 FROM group_whitelist WHERE group_id=?", (group_id,)
+            ).fetchone()
+        return row is not None
+
+    def list_group_whitelist(self) -> list[tuple[str, str, str]]:
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT group_id,added_by,added_at FROM group_whitelist ORDER BY group_id"
+            ).fetchall()
+        return [(str(row["group_id"]), str(row["added_by"]), str(row["added_at"])) for row in rows]
 
     def set_list_member(self, group_id: str, user_id: str, list_type: str, present: bool) -> None:
         with self.lock:

@@ -6,7 +6,27 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from rules import find_keyword_action, find_number_or_link, find_segment_kinds, parse_target_from_text, stronger_action
+from rules import (
+    extract_plain_text,
+    find_keyword_action,
+    find_number_or_link,
+    find_segment_kinds,
+    parse_target_from_text,
+    stronger_action,
+)
+
+
+class Plain:
+    def __init__(self, text: str):
+        self.text = text
+
+
+class At:
+    qq = "12345678"
+
+
+class Reply:
+    message_str = "违规词"
 
 
 class RulesTests(unittest.TestCase):
@@ -19,6 +39,10 @@ class RulesTests(unittest.TestCase):
         self.assertEqual(kinds, {"card", "image"})
         self.assertEqual(stronger_action(["recall", "mute"]), "mute")
         self.assertEqual(find_keyword_action("请不要剧透", [("剧透", "recall")]), ("剧透", "recall"))
+
+    def test_only_new_plain_text_is_scanned(self) -> None:
+        self.assertEqual(extract_plain_text([At(), Reply(), Plain("正常内容")]), "正常内容")
+        self.assertEqual(find_number_or_link(extract_plain_text([At(), Reply()])), set())
 
 
 if __name__ == "__main__":

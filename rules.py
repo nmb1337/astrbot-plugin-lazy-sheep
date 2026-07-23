@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 
 SECURITY_KINDS = ("card", "number", "link", "image", "qrcode")
@@ -34,14 +34,36 @@ def find_segment_kinds(segments: Iterable[object]) -> set[str]:
     """按 OneBot v11 原始消息段识别卡片和图片。"""
     kinds: set[str] = set()
     for segment in segments:
-        if not isinstance(segment, dict):
-            continue
-        segment_type = str(segment.get("type", "")).lower()
+        if isinstance(segment, Mapping):
+            segment_type = str(segment.get("type", "")).lower()
+        else:
+            segment_type = type(segment).__name__.lower()
+            if segment_type in {"plain", "text"}:
+                continue
         if segment_type in {"json", "xml"}:
             kinds.add("card")
         if segment_type == "image":
             kinds.add("image")
     return kinds
+
+
+def extract_plain_text(components: Iterable[object], raw_segments: Iterable[object] = ()) -> str:
+    """只提取当前消息的纯文本，忽略 @、回复、图片和其他消息段。"""
+    parts: list[str] = []
+    component_list = list(components)
+    source = component_list if component_list else list(raw_segments)
+    for component in source:
+        if isinstance(component, Mapping):
+            segment_type = str(component.get("type", "")).lower()
+            if segment_type in {"text", "plain"}:
+                data = component.get("data", {})
+                if isinstance(data, Mapping):
+                    parts.append(str(data.get("text", "")))
+            continue
+        component_type = type(component).__name__.lower()
+        if component_type in {"plain", "text"}:
+            parts.append(str(getattr(component, "text", "")))
+    return "".join(parts)
 
 
 def find_keyword_action(text: str, rules: Iterable[tuple[str, str]]) -> tuple[str, str] | None:
