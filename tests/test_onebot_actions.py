@@ -74,13 +74,21 @@ class FakeBot:
         self.calls: list[tuple[str, dict]] = []
         self.roles = {"200": "admin", "300": "owner"}
         self.fail_actions: set[str] = set()
+        self.fail_message_ids: set[str] = set()
+        self.history_responses: list[object] = []
 
     async def call_action(self, action: str, **payload):
         self.calls.append((action, payload))
-        if action == "get_group_member_info":
-            return {"role": self.roles.get(str(payload.get("user_id")), "member")}
         if action in self.fail_actions:
             return {"retcode": 100, "status": "failed", "wording": "模拟失败"}
+        if action == "get_group_member_info":
+            return {"role": self.roles.get(str(payload.get("user_id")), "member")}
+        if action == "get_group_msg_history":
+            if self.history_responses:
+                return self.history_responses.pop(0)
+            return {"retcode": 0, "status": "ok", "data": {"messages": []}}
+        if action == "delete_msg" and str(payload.get("message_id")) in self.fail_message_ids:
+            return {"retcode": 100, "status": "failed", "wording": "无法撤回"}
         return {"retcode": 0, "status": "ok", "data": {}}
 
 
@@ -90,11 +98,14 @@ class Image:
 
 
 class At:
-    qq = "12345678"
+    def __init__(self, qq: str = "12345678") -> None:
+        self.qq = qq
 
 
 class Reply:
-    message_str = "违规词"
+    def __init__(self, message_id: str = "") -> None:
+        self.id = message_id
+        self.message_str = "违规词"
 
 
 class Plain:
@@ -155,6 +166,25 @@ class OneBotActionTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.store.close()
         self.tempdir.cleanup()
 
+    @staticmethod
+    def _history_message(
+        message_id: str,
+        user_id: str,
+        *,
+        group_id: str = "100",
+        message_seq: int | None = None,
+        timestamp: int | None = None,
+    ) -> dict:
+        return {
+            "message_id": message_id,
+            "message_seq": message_seq if message_seq is not None else int(message_id),
+            "time": timestamp if timestamp is not None else int(message_id),
+            "group_id": group_id,
+            "user_id": user_id,
+            "sender": {"user_id": user_id},
+            "message": [],
+        }
+
     async def test_security_rule_calls_recall_and_mute_actions(self) -> None:
         self.plugin.store.set_security_rule("100", "link", "mute")
         self.assertTrue(await self.plugin._moderate_message(self.event))
@@ -188,6 +218,16 @@ class OneBotActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.plugin._moderate_message(FakeEvent("@昵称(12345678)", [At()])))
         self.assertFalse(await self.plugin._moderate_message(FakeEvent("[引用消息: 违规词]", [Reply()])))
         self.assertTrue(await self.plugin._moderate_message(FakeEvent("违规词", [Plain("违规词")])))
+
+    async def test_link_security_moderates_share_segment_without_scanning_mentions(self) -> None:
+        event = FakeEvent("")
+        event.message_obj.raw_message["message"] = [
+            {"type": "share", "data": {"url": "b23.tv/abcdef"}},
+        ]
+        self.plugin.store.set_security_rule("100", "link", "recall")
+
+        self.assertTrue(await self.plugin._moderate_message(event))
+        self.assertEqual(event.bot.calls[-1], ("delete_msg", {"message_id": 42}))
 
     async def test_admin_command_requires_group_owner(self) -> None:
         event = FakeEvent("上管 12345678", [Plain("上管 12345678")])
@@ -226,6 +266,122 @@ class OneBotActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results, [])
         self.assertTrue(event.stopped)
         self.assertFalse(event.call_llm)
+
+    async def test_recall_reply_and_message_id_remain_single_message_actions(self) -> None:
+        event = FakeEvent("撤回", [Reply("777")])
+        event.message_obj.raw_message["sender"]["role"] = "admin"
+        reply = await self.plugin._dispatch_command(event, event.message_str)
+        self.assertEqual(reply.text, "已撤回目标消息。")
+        self.assertEqual(event.bot.calls[-1], ("delete_msg", {"message_id": 777}))
+
+        event = FakeEvent("撤回 888", [Plain("撤回 888")])
+        event.message_obj.raw_message["sender"]["role"] = "admin"
+        reply = await self.plugin._dispatch_command(event, event.message_str)
+        self.assertEqual(reply.text, "已撤回目标消息。")
+        self.assertEqual(event.bot.calls[-1], ("delete_msg", {"message_id": 888}))
+
+    async def test_batch_recall_by_qq_uses_nested_history_and_filters_messages(self) -> None:
+        event = FakeEvent("撤回 12345678 3", [Plain("撤回 12345678 3")])
+        event.message_obj.raw_message["sender"]["role"] = "admin"
+        event.bot.history_responses = [
+            {
+                "retcode": 0,
+                "status": "ok",
+                "data": {
+                    "messages": [
+                        self._history_message("42", "12345678", timestamp=9),
+                        self._history_message("10", "12345678", timestamp=2),
+                        self._history_message("11", "99999999", timestamp=4),
+                        self._history_message("12", "12345678", group_id="101", timestamp=5),
+                        self._history_message("13", "12345678", timestamp=7),
+                    ]
+                },
+            }
+        ]
+
+        reply = await self.plugin._dispatch_command(event, event.message_str)
+
+        self.assertIn("成功 2 条，失败 0 条；已找到 2/3 条", reply.text)
+        delete_calls = [payload for name, payload in event.bot.calls if name == "delete_msg"]
+        self.assertEqual(delete_calls, [{"message_id": 13}, {"message_id": 10}])
+
+    async def test_batch_recall_by_at_supports_direct_history_response(self) -> None:
+        event = FakeEvent("撤回 @成员 1", [At("12345678"), Plain("撤回 @成员 1")])
+        event.message_obj.raw_message["sender"]["role"] = "admin"
+        event.bot.history_responses = [{"messages": [self._history_message("15", "12345678")]}]
+
+        reply = await self.plugin._dispatch_command(event, event.message_str)
+
+        self.assertIn("成功 1 条，失败 0 条", reply.text)
+        self.assertEqual(event.bot.calls[-1], ("delete_msg", {"message_id": 15}))
+
+    async def test_batch_recall_paginates_and_reports_partial_delete_failures(self) -> None:
+        event = FakeEvent("撤回 12345678 2", [Plain("撤回 12345678 2")])
+        event.message_obj.raw_message["sender"]["role"] = "admin"
+        first_page = [self._history_message(str(index), "99999999") for index in range(1, 201)]
+        event.bot.history_responses = [
+            {"messages": first_page},
+            {"data": {"messages": [
+                self._history_message("401", "12345678", timestamp=401),
+                self._history_message("400", "12345678", timestamp=400),
+            ]}},
+        ]
+        event.bot.fail_message_ids.add("400")
+
+        reply = await self.plugin._dispatch_command(event, event.message_str)
+
+        history_calls = [payload for name, payload in event.bot.calls if name == "get_group_msg_history"]
+        self.assertEqual(len(history_calls), 2)
+        self.assertIn("message_seq", history_calls[1])
+        self.assertTrue(history_calls[1]["reverse_order"])
+        self.assertIn("成功 1 条，失败 1 条", reply.text)
+
+    async def test_batch_recall_rejects_invalid_count_and_unsupported_history(self) -> None:
+        event = FakeEvent("撤回 12345678 101", [Plain("撤回 12345678 101")])
+        event.message_obj.raw_message["sender"]["role"] = "admin"
+        reply = await self.plugin._dispatch_command(event, event.message_str)
+        self.assertEqual(reply.text, "批量撤回数量需为 1–100。")
+        self.assertNotIn("get_group_msg_history", [name for name, _ in event.bot.calls])
+
+        event = FakeEvent("撤回 12345678 1", [Plain("撤回 12345678 1")])
+        event.message_obj.raw_message["sender"]["role"] = "admin"
+        event.bot.fail_actions.add("get_group_msg_history")
+        reply = await self.plugin._dispatch_command(event, event.message_str)
+        self.assertIn("批量撤回不可用", reply.text)
+        self.assertNotIn("delete_msg", [name for name, _ in event.bot.calls])
+
+    async def test_whole_ban_requires_fresh_group_role(self) -> None:
+        event = FakeEvent("说话", [Plain("说话")])
+        event.message_obj.raw_message["sender"]["role"] = "admin"
+        event.bot.roles["200"] = "member"
+
+        reply = await self.plugin._dispatch_command(event, event.message_str)
+
+        self.assertIn("只有群主、群管理员或 AstrBot 管理员", reply.text)
+        self.assertIn("get_group_member_info", [name for name, _ in event.bot.calls])
+        self.assertNotIn("set_group_whole_ban", [name for name, _ in event.bot.calls])
+
+    async def test_whole_ban_denies_when_role_lookup_fails(self) -> None:
+        event = FakeEvent("安静", [Plain("安静")])
+        event.message_obj.raw_message["sender"]["role"] = "owner"
+        event.bot.fail_actions.add("get_group_member_info")
+
+        reply = await self.plugin._dispatch_command(event, event.message_str)
+
+        self.assertIn("只有群主、群管理员或 AstrBot 管理员", reply.text)
+        self.assertNotIn("set_group_whole_ban", [name for name, _ in event.bot.calls])
+
+    async def test_whole_ban_allows_owner_admin_and_astrbot_admin(self) -> None:
+        for role, astrbot_admin in (("owner", False), ("admin", False), ("member", True)):
+            event = FakeEvent("安静", [Plain("安静")])
+            event.message_obj.raw_message["sender"]["role"] = "member"
+            event.bot.roles["200"] = role
+            event.admin = astrbot_admin
+
+            reply = await self.plugin._dispatch_command(event, event.message_str)
+
+            self.assertEqual(reply.text, "已开启全员禁言。")
+            self.assertIn("set_group_whole_ban", [name for name, _ in event.bot.calls])
 
 
 if __name__ == "__main__":

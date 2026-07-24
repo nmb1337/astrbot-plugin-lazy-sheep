@@ -11,8 +11,29 @@ ACTIONS = ("recall", "mute")
 
 # 中国手机号码与常见 QQ 号长度。边界避免把更长的数字的一部分误判为号码。
 NUMBER_RE = re.compile(r"(?<!\d)(?:1[3-9]\d{9}|[1-9]\d{4,11})(?!\d)")
-LINK_RE = re.compile(r"(?i)(?:https?://|www\.)[^\s<>]+")
+_URL_BODY = r"[^\s<>\"'，。！？、；：()（）\[\]{}]+"
+_DOMAIN_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_TOP_LEVEL_DOMAIN = r"(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})"
+_DOMAIN = rf"(?:{_DOMAIN_LABEL}\.)+{_TOP_LEVEL_DOMAIN}"
+_IPV4_PART = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+_IPV4 = rf"(?:{_IPV4_PART}\.){{3}}{_IPV4_PART}"
+
+# 协议链接、www、裸域名/短链和 IPv4 地址。裸域名必须含有字母顶级域，避免把版本号当链接。
+LINK_RE = re.compile(
+    rf"""(?ix)
+    (?:
+        https?://{_URL_BODY}
+        | www\.{_URL_BODY}
+        | (?<![a-z0-9_.-]){_DOMAIN}(?::\d{{1,5}})?(?:[/?#]{_URL_BODY})?
+        | (?<![\d.]){_IPV4}(?::\d{{1,5}})?(?:[/?#]{_URL_BODY})?
+    )
+    """
+)
 QQ_RE = re.compile(r"(?<!\d)([1-9]\d{4,11})(?!\d)")
+
+_URL_SEGMENT_TYPES = frozenset({"share", "music", "markdown", "json", "xml", "miniapp"})
+_URL_FIELD_NAMES = ("url", "jump_url", "jumpurl", "target_url", "targeturl", "link", "href")
+_PAYLOAD_FIELD_NAMES = ("data", "content", "markdown", "text")
 
 
 def normalized_text(text: str) -> str:
@@ -30,8 +51,32 @@ def find_number_or_link(text: str) -> set[str]:
     return kinds
 
 
+def _segment_has_link(segment: object, segment_type: str) -> bool:
+    """扫描当前消息中确定会承载跳转链接的消息段，排除 @ 与引用消息。"""
+    if segment_type not in _URL_SEGMENT_TYPES:
+        return False
+    values: list[object] = []
+    if isinstance(segment, Mapping):
+        data = segment.get("data", {})
+        containers = (segment, data) if isinstance(data, Mapping) else (segment,)
+        for container in containers:
+            for key in _URL_FIELD_NAMES:
+                values.append(container.get(key, ""))
+        if segment_type in {"markdown", "json", "xml", "miniapp"}:
+            if isinstance(data, Mapping):
+                values.extend(data.get(key, "") for key in _PAYLOAD_FIELD_NAMES)
+            else:
+                values.append(data)
+    else:
+        for key in _URL_FIELD_NAMES:
+            values.append(getattr(segment, key, ""))
+        if segment_type in {"markdown", "json", "xml", "miniapp"}:
+            values.extend(getattr(segment, key, "") for key in _PAYLOAD_FIELD_NAMES)
+    return any(isinstance(value, str) and LINK_RE.search(value) for value in values)
+
+
 def find_segment_kinds(segments: Iterable[object]) -> set[str]:
-    """按 OneBot v11 原始消息段识别卡片和图片。"""
+    """按 OneBot v11 当前消息段识别卡片、图片及消息段内的链接。"""
     kinds: set[str] = set()
     for segment in segments:
         if isinstance(segment, Mapping):
@@ -44,6 +89,8 @@ def find_segment_kinds(segments: Iterable[object]) -> set[str]:
             kinds.add("card")
         if segment_type == "image":
             kinds.add("image")
+        if _segment_has_link(segment, segment_type):
+            kinds.add("link")
     return kinds
 
 

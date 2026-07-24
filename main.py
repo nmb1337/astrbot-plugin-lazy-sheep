@@ -202,6 +202,19 @@ class LazySheepPlugin(Star):
             return "只有群主、群管理员或 AstrBot 管理员可以执行此操作。"
         return None
 
+    async def _require_whole_ban_operator(self, event: AstrMessageEvent) -> str | None:
+        """全员禁言需要实时确认 QQ 身份，不能使用短时角色缓存。"""
+        if not self._is_group(event):
+            return "此功能仅可在 QQ 群聊中使用。"
+        if event.get_platform_name() != "aiocqhttp":
+            return "此功能仅支持 QQ OneBot v11。"
+        if event.is_admin():
+            return None
+        role = await self._get_member_role(event, event.get_sender_id(), force=True)
+        if role not in {"owner", "admin"}:
+            return "只有群主、群管理员或 AstrBot 管理员可以开启或解除全员禁言。"
+        return None
+
     def _extract_target(self, event: AstrMessageEvent, text: str) -> str | None:
         for component in event.get_messages():
             if self._component_name(component) == "at":
@@ -217,6 +230,127 @@ class LazySheepPlugin(Star):
                 if value:
                     return value
         return None
+
+    @staticmethod
+    def _history_message_id(message: Mapping[str, Any]) -> str:
+        value = message.get("message_id", "")
+        return str(value) if value is not None else ""
+
+    @staticmethod
+    def _history_cursor(message: Mapping[str, Any]) -> str:
+        for key in ("message_seq", "message_id"):
+            value = message.get(key)
+            if value is not None and str(value):
+                return str(value)
+        return ""
+
+    @classmethod
+    def _history_sort_key(cls, message: Mapping[str, Any]) -> tuple[int, int]:
+        def number(value: Any) -> int:
+            try:
+                return int(str(value))
+            except (TypeError, ValueError):
+                return 0
+
+        return number(message.get("time")), number(message.get("message_seq", message.get("message_id")))
+
+    @staticmethod
+    def _history_messages(result: Any) -> list[Mapping[str, Any]] | None:
+        """兼容标准 OneBot 包装的 data.messages 与 NapCat 的直接 messages。"""
+        if not isinstance(result, Mapping):
+            return None
+        payload = result.get("data") if isinstance(result.get("data"), Mapping) else result
+        messages = payload.get("messages") if isinstance(payload, Mapping) else None
+        if not isinstance(messages, list):
+            return None
+        return [message for message in messages if isinstance(message, Mapping)]
+
+    async def _recent_member_messages(
+        self,
+        event: AstrMessageEvent,
+        target: str,
+        amount: int,
+    ) -> list[Mapping[str, Any]]:
+        """读取目标成员最近消息，最多翻查 1,000 条，避免群历史接口被滥用。"""
+        group_id = self._group_id(event)
+        current_message_id = str(
+            getattr(event.message_obj, "message_id", "") or self._raw(event).get("message_id", "")
+        )
+        page_size = 200
+        max_pages = 5
+        cursor = ""
+        seen_message_ids: set[str] = set()
+        target_messages: list[Mapping[str, Any]] = []
+
+        for _ in range(max_pages):
+            payload: dict[str, Any] = {
+                "group_id": self._number(group_id),
+                "count": page_size,
+            }
+            if cursor:
+                payload.update(
+                    {
+                        "message_seq": self._number(cursor),
+                        "reverse_order": True,
+                        "reverseOrder": True,
+                    }
+                )
+            result = await self._onebot_action(event, "get_group_msg_history", **payload)
+            page = self._history_messages(result)
+            if page is None:
+                raise RuntimeError("当前协议端未返回群历史消息")
+            if not page:
+                break
+
+            for message in page:
+                message_id = self._history_message_id(message)
+                if not message_id or message_id in seen_message_ids or message_id == current_message_id:
+                    continue
+                seen_message_ids.add(message_id)
+                message_group_id = str(message.get("group_id", ""))
+                if message_group_id and message_group_id != group_id:
+                    continue
+                sender = message.get("sender", {})
+                sender_id = ""
+                if isinstance(sender, Mapping):
+                    sender_id = str(sender.get("user_id", ""))
+                sender_id = sender_id or str(message.get("user_id", ""))
+                if sender_id == target:
+                    target_messages.append(message)
+
+            if len(target_messages) >= amount or len(page) < page_size:
+                break
+            oldest = min(page, key=self._history_sort_key)
+            next_cursor = self._history_cursor(oldest)
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+
+        target_messages.sort(key=self._history_sort_key, reverse=True)
+        return target_messages[:amount]
+
+    async def _batch_recall(self, event: AstrMessageEvent, target: str, amount: int) -> CommandReply:
+        try:
+            messages = await self._recent_member_messages(event, target, amount)
+        except Exception as exc:
+            logger.warning("批量撤回无法读取群历史消息: %s", exc)
+            return CommandReply(text=f"批量撤回不可用：无法读取群历史消息（{exc}）。")
+        if not messages:
+            return CommandReply(text=f"未找到该成员可撤回的最近 {amount} 条消息。")
+
+        succeeded = 0
+        failed = 0
+        for message in messages:
+            message_id = self._history_message_id(message)
+            try:
+                await self._onebot_action(event, "delete_msg", message_id=self._number(message_id))
+                succeeded += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning("批量撤回消息 %s 失败: %s", message_id, exc)
+
+        found_note = f"；已找到 {len(messages)}/{amount} 条" if len(messages) < amount else ""
+        return CommandReply(text=f"批量撤回完成：成功 {succeeded} 条，失败 {failed} 条{found_note}。")
 
     def _extract_duration(self, event: AstrMessageEvent, text: str, target: str) -> int:
         # @ 目标时可取结尾短数字；纯 QQ 号目标时只读取 QQ 号后的独立数字。
@@ -605,7 +739,7 @@ class LazySheepPlugin(Star):
 
         # 群管理命令。
         if text in {"安静", "说话"}:
-            denied = await self._require_manager(event)
+            denied = await self._require_whole_ban_operator(event)
             if denied:
                 return CommandReply(text=denied)
             try:
@@ -618,16 +752,25 @@ class LazySheepPlugin(Star):
                 return CommandReply(text="已开启全员禁言。" if text == "安静" else "已解除全员禁言。")
             except Exception as exc:
                 return CommandReply(text=f"操作失败：{exc}")
-        if text == "撤回" or re.fullmatch(r"撤回\s+\d+", text):
+        if re.match(r"^撤回(?:\s|$)", text):
             denied = await self._require_manager(event)
             if denied:
                 return CommandReply(text=denied)
+            batch_match = re.fullmatch(r"撤回\s+.+?\s+(\d+)", text)
+            if batch_match:
+                target = self._extract_target(event, text)
+                amount = int(batch_match.group(1))
+                if not target:
+                    return CommandReply(text="请使用“撤回 @成员 N”或“撤回 QQ号 N”。")
+                if not 1 <= amount <= 100:
+                    return CommandReply(text="批量撤回数量需为 1–100。")
+                return await self._batch_recall(event, target, amount)
             message_id = self._extract_reply_message_id(event)
             if not message_id:
                 parts = text.split()
-                message_id = parts[1] if len(parts) == 2 else None
+                message_id = parts[1] if len(parts) == 2 and parts[1].isdigit() else None
             if not message_id:
-                return CommandReply(text="请回复目标消息后发送“撤回”，或使用“撤回 消息ID”。")
+                return CommandReply(text="请回复目标消息发送“撤回”，使用“撤回 消息ID”，或“撤回 @成员 N”。")
             try:
                 await self._onebot_action(event, "delete_msg", message_id=self._number(message_id))
                 return CommandReply(text="已撤回目标消息。")
