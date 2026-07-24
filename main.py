@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import re
+from urllib.parse import unquote, urlparse
+from urllib.request import urlopen
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -215,6 +218,42 @@ class LazySheepPlugin(Star):
             return "只有群主、群管理员或 AstrBot 管理员可以开启或解除全员禁言。"
         return None
 
+    @staticmethod
+    def _onebot_data(result: Any) -> Mapping[str, Any] | None:
+        if not isinstance(result, Mapping):
+            return None
+        data = result.get("data")
+        return data if isinstance(data, Mapping) else result
+
+    async def _whole_ban_enabled(self, event: AstrMessageEvent) -> bool:
+        """读取 OneBot 当前群全员禁言状态，兼容 NapCat/Lagrange 常见字段。"""
+        result = await self._onebot_action(
+            event,
+            "get_group_info",
+            group_id=self._number(self._group_id(event)),
+        )
+        group_info = self._onebot_data(result)
+        if not group_info:
+            raise RuntimeError("协议端未返回群禁言状态")
+        values = (
+            group_info.get("group_all_shut"),
+            group_info.get("shutup_all"),
+            group_info.get("is_whole_ban"),
+            group_info.get("whole_ban"),
+            group_info.get("shutup"),
+            group_info.get("shut_up"),
+        )
+        for value in values:
+            if isinstance(value, str):
+                if value.strip().lower() in {"1", "true", "on", "yes", "-1"}:
+                    return True
+            elif isinstance(value, bool):
+                if value:
+                    return True
+            elif isinstance(value, (int, float)) and value != 0:
+                return True
+        return False
+
     def _extract_target(self, event: AstrMessageEvent, text: str) -> str | None:
         for component in event.get_messages():
             if self._component_name(component) == "at":
@@ -398,7 +437,7 @@ class LazySheepPlugin(Star):
             self.store.record_invite(group_id, user_id, inviter_id)
 
     async def _has_qrcode(self, event: AstrMessageEvent) -> bool:
-        """仅在二维码规则开启时调用，避免普通图片消息带来额外耗时。"""
+        """扫描图片组件和原始 OneBot 图片段，解码失败时仍识别二维码定位图形。"""
         try:
             import cv2  # 延迟导入，插件无法安装依赖时仍可加载其他功能。
             import numpy as np
@@ -406,25 +445,78 @@ class LazySheepPlugin(Star):
             logger.warning("未安装 OpenCV，二维码保安无法工作")
             return False
         detector = cv2.QRCodeDetector()
-        for component in event.get_messages():
-            if self._component_name(component) != "image":
+
+        async def resolve_component(component: object) -> str:
+            try:
+                convert_to_file_path = getattr(component, "convert_to_file_path", None)
+                if convert_to_file_path:
+                    return str(await convert_to_file_path())
+            except Exception as exc:
+                logger.debug("二维码图片组件转换失败: %s", exc)
+            return ""
+
+        component_sources = [
+            await resolve_component(component)
+            for component in event.get_messages()
+            if self._component_name(component) == "image"
+        ]
+        raw_sources: list[str] = []
+        raw_segments = self._raw(event).get("message", [])
+        if isinstance(raw_segments, list):
+            for segment in raw_segments:
+                if not isinstance(segment, Mapping) or str(segment.get("type", "")).lower() != "image":
+                    continue
+                data = segment.get("data", {})
+                if not isinstance(data, Mapping):
+                    continue
+                segment_sources: list[str] = []
+                for key in ("path", "url", "file"):
+                    value = data.get(key)
+                    if isinstance(value, str) and value:
+                        segment_sources.append(value)
+                raw_sources.extend(segment_sources)
+                file_id = str(data.get("file", "") or data.get("file_id", ""))
+                if file_id and not any(
+                    source.startswith(("http://", "https://", "file:", "base64://", "data:"))
+                    for source in segment_sources
+                ):
+                    try:
+                        resolved = self._onebot_data(
+                            await self._onebot_action(event, "get_image", file=file_id)
+                        )
+                        if resolved:
+                            for key in ("file", "url"):
+                                value = resolved.get(key)
+                                if isinstance(value, str) and value:
+                                    raw_sources.append(value)
+                    except Exception as exc:
+                        logger.debug("二维码图片文件 ID 解析失败（%s）: %s", file_id, exc)
+
+        for source in dict.fromkeys([*component_sources, *raw_sources]):
+            if not source:
                 continue
             try:
-                local_path = await component.convert_to_file_path()
-                image_bytes = np.fromfile(str(local_path), dtype=np.uint8)
+                if source.startswith("base64://"):
+                    image_bytes = np.frombuffer(base64.b64decode(source.removeprefix("base64://")), dtype=np.uint8)
+                elif source.startswith("data:image") and "," in source:
+                    image_bytes = np.frombuffer(base64.b64decode(source.split(",", 1)[1]), dtype=np.uint8)
+                elif source.startswith(("http://", "https://")):
+                    image_bytes = np.frombuffer(await asyncio.to_thread(lambda: urlopen(source, timeout=10).read()), dtype=np.uint8)
+                else:
+                    local_path = unquote(urlparse(source).path) if source.startswith("file:") else source
+                    image_bytes = np.fromfile(local_path, dtype=np.uint8)
                 image = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
                 if image is None:
-                    image = cv2.imread(str(local_path))
-                if image is None:
+                    logger.debug("二维码图片无法解码: %s", source)
                     continue
-                decoded, _, _ = detector.detectAndDecode(image)
-                if decoded:
+                decoded, points, _ = detector.detectAndDecode(image)
+                if decoded or points is not None:
                     return True
                 multi_result = detector.detectAndDecodeMulti(image)
-                if len(multi_result) >= 1 and bool(multi_result[0]):
+                if len(multi_result) >= 3 and (bool(multi_result[0]) or multi_result[2] is not None):
                     return True
             except Exception as exc:
-                logger.debug("二维码检测失败: %s", exc)
+                logger.debug("二维码检测失败（%s）: %s", source, exc)
         return False
 
     async def _moderate_message(self, event: AstrMessageEvent) -> bool:
@@ -743,6 +835,8 @@ class LazySheepPlugin(Star):
             if denied:
                 return CommandReply(text=denied)
             try:
+                if text == "说话" and not await self._whole_ban_enabled(event):
+                    return CommandReply(text="当前未开启全员禁言，无需解除。")
                 await self._onebot_action(
                     event,
                     "set_group_whole_ban",

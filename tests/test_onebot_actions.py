@@ -8,6 +8,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 def _install_astrbot_stubs() -> None:
@@ -76,6 +77,7 @@ class FakeBot:
         self.fail_actions: set[str] = set()
         self.fail_message_ids: set[str] = set()
         self.history_responses: list[object] = []
+        self.group_info: dict = {"group_all_shut": 0}
 
     async def call_action(self, action: str, **payload):
         self.calls.append((action, payload))
@@ -83,6 +85,10 @@ class FakeBot:
             return {"retcode": 100, "status": "failed", "wording": "模拟失败"}
         if action == "get_group_member_info":
             return {"role": self.roles.get(str(payload.get("user_id")), "member")}
+        if action == "get_group_info":
+            return {"retcode": 0, "status": "ok", "data": self.group_info}
+        if action == "get_image":
+            return {"retcode": 0, "status": "ok", "data": {"file": "resolved-qr.png"}}
         if action == "get_group_msg_history":
             if self.history_responses:
                 return self.history_responses.pop(0)
@@ -152,6 +158,9 @@ class FakeEvent:
     def should_call_llm(self, value: bool):
         self.call_llm = value
 
+    def plain_result(self, text: str):
+        return text
+
 
 class OneBotActionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -212,6 +221,51 @@ class OneBotActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.plugin._moderate_message(event))
         self.assertIn("set_group_ban", [name for name, _ in event.bot.calls])
 
+    async def test_qrcode_raw_image_segment_is_detected_and_recalled(self) -> None:
+        event = FakeEvent("")
+        event.message_obj.raw_message["message"] = [
+            {"type": "image", "data": {"file": "raw-qr.png", "url": "https://example.invalid/qr.png"}},
+        ]
+        self.plugin.store.set_security_rule("100", "qrcode", "recall")
+
+        detector = SimpleNamespace(
+            detectAndDecode=lambda _image: ("", object(), None),
+            detectAndDecodeMulti=lambda _image: (False, (), None, ()),
+        )
+        fake_cv2 = SimpleNamespace(
+            QRCodeDetector=lambda: detector,
+            IMREAD_COLOR=1,
+            imdecode=lambda _data, _mode: object(),
+        )
+        fake_numpy = SimpleNamespace(fromfile=lambda _path, dtype: object(), uint8=object())
+        with patch.dict(sys.modules, {"cv2": fake_cv2, "numpy": fake_numpy}):
+            self.assertTrue(await self.plugin._moderate_message(event))
+
+        self.assertEqual(event.bot.calls[-1], ("delete_msg", {"message_id": 42}))
+
+    async def test_qrcode_image_file_id_is_resolved_before_detection(self) -> None:
+        event = FakeEvent("")
+        event.message_obj.raw_message["message"] = [
+            {"type": "image", "data": {"file": "qr-file-id"}},
+        ]
+        self.plugin.store.set_security_rule("100", "qrcode", "recall")
+
+        detector = SimpleNamespace(
+            detectAndDecode=lambda _image: ("", object(), None),
+            detectAndDecodeMulti=lambda _image: (False, (), None, ()),
+        )
+        fake_cv2 = SimpleNamespace(
+            QRCodeDetector=lambda: detector,
+            IMREAD_COLOR=1,
+            imdecode=lambda _data, _mode: object(),
+        )
+        fake_numpy = SimpleNamespace(fromfile=lambda _path, dtype: object(), uint8=object())
+        with patch.dict(sys.modules, {"cv2": fake_cv2, "numpy": fake_numpy}):
+            self.assertTrue(await self.plugin._moderate_message(event))
+
+        self.assertIn("get_image", [name for name, _ in event.bot.calls])
+        self.assertEqual(event.bot.calls[-1], ("delete_msg", {"message_id": 42}))
+
     async def test_mentions_and_replies_do_not_trigger_text_rules(self) -> None:
         self.plugin.store.set_security_rule("100", "number", "recall")
         self.plugin.store.set_keyword_rule("100", "违规词", "recall")
@@ -266,6 +320,21 @@ class OneBotActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results, [])
         self.assertTrue(event.stopped)
         self.assertFalse(event.call_llm)
+
+    async def test_group_gate_defaults_to_on_for_unregistered_groups(self) -> None:
+        event = FakeEvent("菜单", [Plain("菜单")])
+        results = [item async for item in self.plugin.on_onebot_event(event)]
+
+        self.assertEqual(results, [])
+        self.assertTrue(event.stopped)
+        self.assertFalse(event.call_llm)
+
+        boot_event = FakeEvent("群开机", [Plain("群开机")])
+        boot_event.message_obj.raw_message["sender"]["role"] = "admin"
+        results = [item async for item in self.plugin.on_onebot_event(boot_event)]
+
+        self.assertTrue(results)
+        self.assertTrue(self.plugin.store.is_group_whitelisted("100"))
 
     async def test_recall_reply_and_message_id_remain_single_message_actions(self) -> None:
         event = FakeEvent("撤回", [Reply("777")])
@@ -382,6 +451,27 @@ class OneBotActionTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(reply.text, "已开启全员禁言。")
             self.assertIn("set_group_whole_ban", [name for name, _ in event.bot.calls])
+
+    async def test_speak_does_not_call_onebot_when_whole_ban_is_off(self) -> None:
+        event = FakeEvent("说话", [Plain("说话")])
+        event.bot.roles["200"] = "admin"
+        event.bot.group_info = {"group_all_shut": 0}
+
+        reply = await self.plugin._dispatch_command(event, event.message_str)
+
+        self.assertEqual(reply.text, "当前未开启全员禁言，无需解除。")
+        self.assertIn("get_group_info", [name for name, _ in event.bot.calls])
+        self.assertNotIn("set_group_whole_ban", [name for name, _ in event.bot.calls])
+
+    async def test_speak_only_disables_an_active_whole_ban(self) -> None:
+        event = FakeEvent("说话", [Plain("说话")])
+        event.bot.roles["200"] = "admin"
+        event.bot.group_info = {"group_all_shut": -1}
+
+        reply = await self.plugin._dispatch_command(event, event.message_str)
+
+        self.assertEqual(reply.text, "已解除全员禁言。")
+        self.assertEqual(event.bot.calls[-1], ("set_group_whole_ban", {"group_id": 100, "enable": False}))
 
 
 if __name__ == "__main__":

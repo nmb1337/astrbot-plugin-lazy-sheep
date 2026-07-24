@@ -108,7 +108,8 @@ class LazySheepStore:
         self.set_group_setting("__global__", "group_whitelist_gate", "1" if enabled else "0")
 
     def is_group_gate_enabled(self) -> bool:
-        return self.get_group_setting("__global__", "group_whitelist_gate", "0") == "1"
+        """群开机门禁默认启用；管理员可用“关闭群白名单”显式停用。"""
+        return self.get_group_setting("__global__", "group_whitelist_gate", "1") == "1"
 
     def set_group_whitelisted(self, group_id: str, present: bool, actor_id: str = "system") -> None:
         now = datetime.now(self.timezone).isoformat(timespec="seconds")

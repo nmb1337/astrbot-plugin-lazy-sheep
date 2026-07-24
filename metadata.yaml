@@ -2,7 +2,7 @@ name: astrbot_plugin_lazy_sheep
 display_name: 懒羊羊大王群管
 desc: QQ OneBot v11 群管理、保安、统计、签到和互动小游戏插件。
 short_desc: 懒羊羊主题的 QQ 群管与互动插件。
-version: 1.0.3
+version: 1.0.4
 author: Codex
 repo: ""
 astrbot_version: ">=4.26,<5"
